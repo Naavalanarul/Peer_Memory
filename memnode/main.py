@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import uuid
 
 from . import config
@@ -93,7 +94,12 @@ def main():
     args = parser.parse_args()
 
     if args.rpc_socket is None:
-        args.rpc_socket = f"/tmp/memcloud-{args.rpc_port}.sock"
+        if os.name == "nt":
+            # Unix sockets are not available on Windows; the RPC server
+            # will fall back to TCP-only mode automatically.
+            args.rpc_socket = ""
+        else:
+            args.rpc_socket = f"/tmp/memcloud-{args.rpc_port}.sock"
 
     logging.basicConfig(level=args.log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 

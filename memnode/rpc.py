@@ -209,7 +209,7 @@ class RpcServer:
                 os.remove(self.rpc_unix_socket)
             server_unix = await asyncio.start_unix_server(self._handle_client, self.rpc_unix_socket)
             logger.info("RPC server listening on %s", self.rpc_unix_socket)
-        except (OSError, NotImplementedError) as e:
+        except (AttributeError, OSError, NotImplementedError) as e:
             logger.warning("unix socket RPC unavailable (%s) -- TCP-only", e)
 
         return server_tcp, server_unix
