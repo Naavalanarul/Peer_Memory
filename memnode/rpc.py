@@ -174,6 +174,18 @@ class RpcServer:
                 return {"ok": False, "error": "not found"}
             return {"ok": True, "data_hex": data.hex()}
 
+        elif op == "remote_free":
+            # Symmetric with remote_store/remote_load: release a block
+            # that was placed on a specific connected peer (by pubkey
+            # prefix), most commonly one this node caused to be stored
+            # there via automatic overflow when its own quota was full.
+            pubkey = await self._resolve_peer(req["peer"])
+            try:
+                freed = await self.replication.free_remote(pubkey, req["block_id"])
+            except RemoteOperationFailed as e:
+                return {"ok": False, "error": str(e)}
+            return {"ok": freed}
+
         else:
             return {"ok": False, "error": f"unknown op: {op}"}
 

@@ -78,9 +78,12 @@ class ReplicationCoordinator:
             await self._serve_store_block(pubkey_hex, msg)
         elif msg.type == MsgType.REQUEST_BLOCK:
             await self._serve_request_block(pubkey_hex, msg)
+        elif msg.type == MsgType.FREE_BLOCK:
+            await self._serve_free_block(pubkey_hex, msg)
         elif msg.type == MsgType.PING:
             await self.peer_manager.send_to(pubkey_hex, Message(MsgType.PONG, {"req_id": req_id}))
-        elif msg.type in (MsgType.BLOCK_DATA, MsgType.BLOCK_NOT_FOUND, MsgType.NACK, MsgType.PONG):
+        elif msg.type in (MsgType.BLOCK_DATA, MsgType.BLOCK_NOT_FOUND, MsgType.NACK, MsgType.PONG,
+                          MsgType.FREED):
             # A reply that arrived after we already timed out and stopped
             # waiting for it. Not an error -- just log and drop it.
             logger.debug("dropping stale/unmatched reply %s from %s", msg.type, pubkey_hex[:8])
@@ -124,6 +127,17 @@ class ReplicationCoordinator:
         else:
             await self.peer_manager.send_to(
                 pubkey_hex, Message(MsgType.BLOCK_DATA, {"req_id": req_id, "data_hex": data.hex()}))
+
+    async def _serve_free_block(self, pubkey_hex: str, msg: Message) -> None:
+        req_id = msg.body.get("req_id")
+        block_id = msg.body.get("block_id")
+        try:
+            freed = await self.block_manager.free(block_id)
+        except Exception:
+            logger.exception("bad FreeBlock request from %s", pubkey_hex[:8])
+            freed = False
+        await self.peer_manager.send_to(
+            pubkey_hex, Message(MsgType.FREED, {"req_id": req_id, "freed": freed}))
 
     # -- making outbound requests to a peer -------------------------------
 
@@ -186,3 +200,21 @@ class ReplicationCoordinator:
             if data is not None:
                 return data
         return None
+
+    async def free_remote(self, pubkey_hex: str, block_id: int, timeout: float = DEFAULT_TIMEOUT) -> bool:
+        """Ask a specific connected peer to free a block it holds for us.
+
+        This is what lets the RPC layer's "free" semantics reach blocks
+        that a store call overflowed onto another node (see rpc.py's
+        "remote_free" op) -- without it, a client has no way to release
+        memory it caused to be allocated on a peer, and freeing only
+        ever worked for blocks held on the node you happen to be talking
+        to.
+        """
+        req_id = uuid.uuid4().hex
+        ok = await self.peer_manager.send_to(pubkey_hex, Message(MsgType.FREE_BLOCK,
+                                                                   {"req_id": req_id, "block_id": block_id}))
+        if not ok:
+            raise RemoteOperationFailed(f"peer {pubkey_hex[:8]} is not connected")
+        reply = await self._await_reply(req_id, timeout)
+        return bool(reply.body.get("freed", False))

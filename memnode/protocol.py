@@ -76,6 +76,12 @@ class MsgType(str, Enum):
     NACK = "Nack"          # explicit failure response -- the reference
                             # implementation had a TODO for this and just
                             # left senders hanging on failure.
+    FREE_BLOCK = "FreeBlock"    # ask a peer to release a block it holds
+                                # for us -- lets the RPC layer's "free"
+                                # semantics extend to remotely-placed
+                                # blocks (see rpc.py's "remote_free" op),
+                                # not just ones stored on this node.
+    FREED = "Freed"             # reply to FreeBlock: {"freed": bool}
     BYE = "Bye"
 
 

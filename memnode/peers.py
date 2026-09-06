@@ -117,7 +117,16 @@ class PeerManager:
         approved = self.consent_callback(pubkey_hex, name, addr)
         if asyncio.iscoroutine(approved):
             approved = await approved
-        return bool(approved)
+        approved = bool(approved)
+        if approved:
+            # This is the actual "trust on first use" step: remember this
+            # identity so future connections skip the consent prompt
+            # entirely (is_trusted() above short-circuits next time).
+            # Without this call the TrustStore/trusted_devices.json file
+            # is inert -- every single connection re-runs consent_callback
+            # from scratch, even from a peer approved a moment ago.
+            self.trust_store.trust(pubkey_hex, name)
+        return approved
 
     async def _register(self, pubkey_hex, name, addr, channel, peer_info):
         async with self._lock:
