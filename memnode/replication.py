@@ -9,7 +9,7 @@ peers.py already has the plumbing to pick a peer with free capacity
 (`best_peer_for_store`) and to send it a message (`send_to`). But
 nothing on the receiving end ever turned an incoming StoreBlock/
 RequestBlock message into a BlockManager call, and nothing on the
-sending end turned "peer X has room" into "ask peer X to store this
+sending end turned "peer X has room" into "ask peer X to store this 
 and wait for the reply". PeerManager was built with a
 `message_handler` hook specifically for this, but main.py never
 supplied one. This module is that missing handler.
@@ -43,8 +43,7 @@ from .blocks import BlockManager, BlockTooLarge, Durability, OutOfMemory
 from .protocol import Message, MsgType
 
 logger = logging.getLogger("memnode.replication")
-
-DEFAULT_TIMEOUT = 5.0
+DEFAULT_TIMEOUT = 30.0
 
 
 class RemoteOperationFailed(Exception):
@@ -152,21 +151,52 @@ class ReplicationCoordinator:
             self._pending.pop(req_id, None)
 
     async def store_remote(self, pubkey_hex: str, data: bytes, *,
-                            durability: Durability = Durability.CACHE,
-                            key: Optional[str] = None, timeout: float = DEFAULT_TIMEOUT) -> int:
-        """Ask a specific connected peer to store `data` in its own RAM
-        quota. Raises RemoteOperationFailed / OutOfMemory on failure."""
+                       durability: Durability = Durability.CACHE,
+                       key: Optional[str] = None,
+                       timeout: float = DEFAULT_TIMEOUT) -> int:
+
         req_id = uuid.uuid4().hex
-        body = {"req_id": req_id, "data_hex": data.hex(), "durability": durability.value}
+
+        body = {
+        "req_id": req_id,
+        "data_hex": data.hex(),
+        "durability": durability.value,
+        }
+
         if key is not None:
             body["key"] = key
-        ok = await self.peer_manager.send_to(pubkey_hex, Message(MsgType.STORE_BLOCK, body))
-        if not ok:
-            raise RemoteOperationFailed(f"peer {pubkey_hex[:8]} is not connected")
-        reply = await self._await_reply(req_id, timeout)
-        if reply.type == MsgType.NACK:
-            raise OutOfMemory(reply.body.get("error", "remote store failed"))
-        return reply.body["block_id"]
+
+        # Register the waiter BEFORE sending the request.
+        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        self._pending[req_id] = fut
+
+        try:
+            ok = await self.peer_manager.send_to(
+                pubkey_hex,
+                Message(MsgType.STORE_BLOCK, body)
+            )
+
+            if not ok:
+                raise RemoteOperationFailed(
+                    f"peer {pubkey_hex[:8]} is not connected"
+            )
+
+            reply = await asyncio.wait_for(fut, timeout)
+
+            if reply.type == MsgType.NACK:
+                raise OutOfMemory(
+                    reply.body.get("error", "remote store failed")
+                )
+
+            return reply.body["block_id"]
+
+        except asyncio.TimeoutError as e:
+            raise RemoteOperationFailed(
+                f"peer did not respond within {timeout}s"
+            ) from e
+
+        finally:
+            self._pending.pop(req_id, None)
 
     async def load_remote(self, pubkey_hex: str, *, block_id: Optional[int] = None,
                            key: Optional[str] = None, timeout: float = DEFAULT_TIMEOUT) -> Optional[bytes]:
@@ -178,13 +208,34 @@ class ReplicationCoordinator:
             body["block_id"] = block_id
         if key is not None:
             body["key"] = key
-        ok = await self.peer_manager.send_to(pubkey_hex, Message(MsgType.REQUEST_BLOCK, body))
-        if not ok:
-            raise RemoteOperationFailed(f"peer {pubkey_hex[:8]} is not connected")
-        reply = await self._await_reply(req_id, timeout)
-        if reply.type == MsgType.BLOCK_NOT_FOUND:
-            return None
-        return bytes.fromhex(reply.body["data_hex"])
+        fut = asyncio.get_event_loop().create_future()
+        self._pending[req_id] = fut
+
+        try:
+            ok = await self.peer_manager.send_to(
+                pubkey_hex,
+                Message(MsgType.REQUEST_BLOCK, body)
+            )
+
+            if not ok:
+                raise RemoteOperationFailed(
+                    f"peer {pubkey_hex[:8]} is not connected"
+                )
+
+            reply = await asyncio.wait_for(fut, timeout)
+
+            if reply.type == MsgType.BLOCK_NOT_FOUND:
+                return None
+
+            return bytes.fromhex(reply.body["data_hex"])
+
+        except asyncio.TimeoutError as e:
+            raise RemoteOperationFailed(
+                f"peer did not respond within {timeout}s"
+            ) from e
+
+        finally:
+            self._pending.pop(req_id, None)
 
     async def load_remote_by_key_anywhere(self, key: str, timeout: float = DEFAULT_TIMEOUT) -> Optional[bytes]:
         """Fan out a by-key lookup to every currently-connected peer and
