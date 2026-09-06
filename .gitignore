@@ -24,10 +24,14 @@ share/python-wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+.pytest_cache/
+.coverage
+htmlcov/
 
 # Virtual environments
 venv/
 .venv/
+.venv
 env/
 .env
 ENV/

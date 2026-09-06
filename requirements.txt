@@ -1,0 +1,5 @@
+msgpack>=1.0
+cryptography>=41.0
+zeroconf>=0.130
+pytest>=7.0
+pytest-asyncio>=0.23
