@@ -9,7 +9,7 @@ is caught and turned into an `{"ok": false, ...}` response rather than
 an unhandled exception that would kill the connection.
 
 For the React frontend specifically: consider adding a small
-websocket/SSE endpoint alongside this for push updates (peer
+websocket/SSE endpoint alongside this for push updates (peer simply change rpc.py to this and git push
 connect/disconnect, stats changes) rather than having the dashboard
 poll `stats`/`peers` in a loop.
 """
@@ -200,16 +200,18 @@ class RpcServer:
         raise KeyError(f"no connected peer matching '{prefix}'")
 
     async def start(self):
-        server_tcp = await asyncio.start_server(self._handle_client, "127.0.0.1", self.rpc_port)
-        logger.info("RPC server listening on 127.0.0.1:%d", self.rpc_port)
-
+        server_tcp = await asyncio.start_server(self._handle_client, "0.0.0.0", self.rpc_port)
+        logger.info("RPC server listening on 0.0.0.0:%d", self.rpc_port)
         server_unix = None
-        try:
-            if os.path.exists(self.rpc_unix_socket):
-                os.remove(self.rpc_unix_socket)
-            server_unix = await asyncio.start_unix_server(self._handle_client, self.rpc_unix_socket)
-            logger.info("RPC server listening on %s", self.rpc_unix_socket)
-        except (AttributeError, OSError, NotImplementedError) as e:
-            logger.warning("unix socket RPC unavailable (%s) -- TCP-only", e)
+        if hasattr(asyncio, "start_unix_server"):
+            try:
+                if os.path.exists(self.rpc_unix_socket):
+                    os.remove(self.rpc_unix_socket)
+                server_unix = await asyncio.start_unix_server(self._handle_client, self.rpc_unix_socket)
+                logger.info("RPC server listening on %s", self.rpc_unix_socket)
+            except (OSError, NotImplementedError) as e:
+                logger.warning("unix socket RPC unavailable (%s) -- TCP-only", e)
+        else:
+            logger.info("unix sockets not supported on this platform -- TCP-only RPC")
 
         return server_tcp, server_unix
