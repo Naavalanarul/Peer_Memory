@@ -393,3 +393,17 @@ A helper client (`demo/demo_client.py`) handles chunked transfers and cleanup.
 This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
 
 **Copyright © 2026 Naavalan A**
+
+---
+
+## Hardening & performance phases
+
+| Phase | Branch | Document |
+| --- | --- | --- |
+| Phase 1 — security hardening | `phase1-security-hardening` | [docs/PHASE1_SECURITY.md](docs/PHASE1_SECURITY.md) |
+
+Phase 1 adds per-frame replay protection and session rekeying, handshake
+rate limiting and timeouts on the peer listener, an authenticated
+loopback-only RPC control plane, optional mTLS with certificate pinning,
+and a trust store with out-of-band (SAS/QR) verification instead of bare
+pubkey-hex TOFU.
