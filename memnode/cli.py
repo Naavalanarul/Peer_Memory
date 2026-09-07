@@ -34,6 +34,8 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+import msgpack
+
 from . import config, rpcauth
 
 # How long to wait for the server's auth challenge before assuming the
@@ -93,15 +95,57 @@ async def _authenticate(reader, writer, token: Optional[str]) -> None:
             f"Check that this client is reading the same token file the daemon wrote.")
 
 
-async def _call(host: str, port: int, req: dict, token: Optional[str] = None) -> dict:
-    reader, writer = await asyncio.open_connection(host, port)
-    await _authenticate(reader, writer, token)
-    raw = json.dumps(req).encode("utf-8")
+async def _read_binary_frame(reader) -> dict:
+    length = struct.unpack(">I", await reader.readexactly(4))[0]
+    if length > config.MAX_RPC_MESSAGE_SIZE:
+        raise ValueError(f"server sent an oversized frame ({length} bytes)")
+    return msgpack.unpackb(await reader.readexactly(length), raw=False)
+
+
+async def _write_binary_frame(writer, obj: dict) -> None:
+    raw = msgpack.packb(obj, use_bin_type=True)
     writer.write(struct.pack(">I", len(raw)) + raw)
     await writer.drain()
-    len_bytes = await reader.readexactly(4)
-    (length,) = struct.unpack(">I", len_bytes)
-    resp = json.loads((await reader.readexactly(length)).decode("utf-8"))
+
+
+def _to_binary_request(req: dict) -> dict:
+    """Hex payload -> raw bytes. Halves the payload and skips a hex pass."""
+    if "data_hex" in req:
+        req = dict(req)
+        req["data"] = bytes.fromhex(req.pop("data_hex"))
+    return req
+
+
+def _normalise_response(resp: dict) -> dict:
+    """Present a binary reply the same way the JSON one is printed."""
+    data = resp.get("data")
+    if isinstance(data, (bytes, bytearray)):
+        resp = dict(resp)
+        resp["data_hex"] = bytes(data).hex()
+        del resp["data"]
+    return resp
+
+
+async def _call(host: str, port: int, req: dict, token: Optional[str] = None,
+                binary: bool = True) -> dict:
+    reader, writer = await asyncio.open_connection(host, port)
+    await _authenticate(reader, writer, token)
+
+    if binary:
+        # Codec negotiation: the magic preamble switches the connection to
+        # msgpack framing with raw binary payloads. The server falls back
+        # to JSON for any client that does not send it.
+        writer.write(config.RPC_MSGPACK_MAGIC)
+        await writer.drain()
+        ack = await _read_binary_frame(reader)
+        if not ack.get("ok"):
+            raise RuntimeError(f"server refused binary framing: {ack}")
+        await _write_binary_frame(writer, _to_binary_request(req))
+        resp = _normalise_response(await _read_binary_frame(reader))
+    else:
+        await _write_frame(writer, req)
+        resp = await _read_frame(reader)
+
     writer.close()
     try:
         await writer.wait_closed()
@@ -118,7 +162,8 @@ async def _run(args: argparse.Namespace) -> int:
     token = _resolve_token(getattr(args, "token", None), getattr(args, "token_file", None))
 
     async def call(req: dict) -> dict:
-        return await _call(args.host, args.port, req, token=token)
+        return await _call(args.host, args.port, req, token=token,
+                           binary=not getattr(args, "json", False))
 
     if args.op == "store":
         payload = args.text.encode("utf-8") if args.text is not None else bytes.fromhex(args.hex)
@@ -212,6 +257,8 @@ def main():
                         help="RPC shared secret (default: read ~/.memcloud/rpc_token)")
     parser.add_argument("--token-file", default=None,
                         help="file to read the RPC shared secret from")
+    parser.add_argument("--json", action="store_true",
+                        help="use the legacy hex+JSON framing instead of msgpack binary")
     sub = parser.add_subparsers(dest="op", required=True)
 
     p_store = sub.add_parser("store", help="store data locally (auto-overflows to a peer if full)")

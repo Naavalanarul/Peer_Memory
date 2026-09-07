@@ -401,9 +401,18 @@ This project is licensed under the MIT License — see the [LICENSE](LICENSE) fi
 | Phase | Branch | Document |
 | --- | --- | --- |
 | Phase 1 — security hardening | `phase1-security-hardening` | [docs/PHASE1_SECURITY.md](docs/PHASE1_SECURITY.md) |
+| Phase 2 — latency reduction | `phase2-latency-reduction` | [docs/PHASE2_LATENCY.md](docs/PHASE2_LATENCY.md) |
 
 Phase 1 adds per-frame replay protection and session rekeying, handshake
 rate limiting and timeouts on the peer listener, an authenticated
 loopback-only RPC control plane, optional mTLS with certificate pinning,
 and a trust store with out-of-band (SAS/QR) verification instead of bare
 pubkey-hex TOFU.
+
+Phase 2 adds msgpack binary RPC framing (JSON clients keep working),
+chunked block transfer with per-transfer logical streams, a round-robin
+connection multiplexer, optional uvloop, and a lock-striped block store
+with O(1) key removal. Reproduce the numbers with `python bench/bench_rpc.py`,
+`bench/bench_hol.py`, `bench/bench_loop.py` and `bench/bench_blocks.py` —
+and note that the lock striping measured close to zero on a single-threaded
+event loop, which is documented rather than glossed over.

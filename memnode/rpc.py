@@ -38,6 +38,8 @@ import os
 import struct
 from typing import Optional
 
+import msgpack
+
 from . import config, rpcauth
 from .blocks import BlockManager, BlockTooLarge, Durability, OutOfMemory
 from .peers import PeerManager
@@ -46,8 +48,9 @@ from .replication import ReplicationCoordinator, RemoteOperationFailed
 logger = logging.getLogger("memnode.rpc")
 
 
-async def _read_json_frame(reader: asyncio.StreamReader) -> dict:
-    len_bytes = await reader.readexactly(4)
+async def _read_json_frame(reader: asyncio.StreamReader,
+                           length_bytes: Optional[bytes] = None) -> dict:
+    len_bytes = length_bytes if length_bytes is not None else await reader.readexactly(4)
     (length,) = struct.unpack(">I", len_bytes)
     if length > config.MAX_RPC_MESSAGE_SIZE:
         raise ValueError(f"RPC message of {length} bytes exceeds MAX_RPC_MESSAGE_SIZE")
@@ -59,6 +62,45 @@ async def _write_json_frame(writer: asyncio.StreamWriter, obj: dict) -> None:
     raw = json.dumps(obj).encode("utf-8")
     writer.write(struct.pack(">I", len(raw)) + raw)
     await writer.drain()
+
+
+async def _read_msgpack_frame(reader: asyncio.StreamReader,
+                              length_bytes: Optional[bytes] = None) -> dict:
+    """Binary sibling of _read_json_frame, with the same size guard.
+
+    The size check happens before the body read, exactly as in the JSON
+    path -- switching codecs must not reopen the unbounded-allocation
+    hole the framing code exists to close.
+    """
+    if length_bytes is None:
+        length_bytes = await reader.readexactly(4)
+    (length,) = struct.unpack(">I", length_bytes)
+    if length > config.MAX_RPC_MESSAGE_SIZE:
+        raise ValueError(f"RPC message of {length} bytes exceeds MAX_RPC_MESSAGE_SIZE")
+    raw = await reader.readexactly(length)
+    return msgpack.unpackb(raw, raw=False)
+
+
+async def _write_msgpack_frame(writer: asyncio.StreamWriter, obj: dict) -> None:
+    raw = msgpack.packb(obj, use_bin_type=True)
+    writer.write(struct.pack(">I", len(raw)) + raw)
+    await writer.drain()
+
+
+def request_payload(req: dict) -> Optional[bytes]:
+    """Read a request payload in either codec.
+
+    Binary clients send raw bytes under ``data``; JSON clients send hex
+    under ``data_hex``. Both are accepted everywhere, so an old client
+    and a new client can talk to the same daemon.
+    """
+    value = req.get("data")
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value)
+    hex_value = req.get("data_hex")
+    if isinstance(hex_value, str):
+        return bytes.fromhex(hex_value)
+    return None
 
 
 class RpcServer:
@@ -135,10 +177,36 @@ class RpcServer:
             except (ConnectionResetError, BrokenPipeError):
                 writer.close()
                 return
+        # Codec negotiation. A client that opens with the 4-byte magic
+        # preamble gets msgpack framing with raw binary payloads; anything
+        # else is the length prefix of a classic JSON frame, so the
+        # original protocol keeps working untouched. Negotiation happens
+        # after auth so that the auth exchange itself is one fixed format.
+        binary = False
+        pending_length: Optional[bytes] = None
+        try:
+            prefix = await reader.readexactly(config.RPC_MAGIC_LEN)
+        except (asyncio.IncompleteReadError, ConnectionResetError):
+            writer.close()
+            return
+        if prefix == config.RPC_MSGPACK_MAGIC:
+            binary = True
+            try:
+                await _write_msgpack_frame(writer, {"ok": True, "codec": "msgpack"})
+            except (ConnectionResetError, BrokenPipeError):
+                writer.close()
+                return
+        else:
+            pending_length = prefix
+
+        read_frame = _read_msgpack_frame if binary else _read_json_frame
+        write_frame = _write_msgpack_frame if binary else _write_json_frame
+
         try:
             while True:
                 try:
-                    req = await _read_json_frame(reader)
+                    req = await read_frame(reader, pending_length)
+                    pending_length = None
                 except asyncio.IncompleteReadError:
                     break
                 except ValueError as e:
@@ -149,27 +217,38 @@ class RpcServer:
                     # position we can no longer trust.
                     logger.warning("RPC client %s sent oversized message: %s", peer, e)
                     try:
-                        await _write_json_frame(writer, {"ok": False, "error": str(e)})
+                        await write_frame(writer, {"ok": False, "error": str(e)})
                     except (ConnectionResetError, BrokenPipeError):
                         pass
                     break
+                except Exception as e:
+                    logger.warning("RPC client %s sent an undecodable frame: %s", peer, e)
+                    break
                 try:
-                    resp = await self._dispatch(req)
+                    resp = await self._dispatch(req, binary=binary)
                 except Exception as e:
                     logger.exception("RPC handler error for op=%s", req.get("op"))
                     resp = {"ok": False, "error": str(e)}
-                await _write_json_frame(writer, resp)
+                await write_frame(writer, resp)
         except (ConnectionResetError, BrokenPipeError):
             pass
         finally:
             writer.close()
             logger.debug("RPC client %s disconnected", peer)
 
-    async def _dispatch(self, req: dict) -> dict:
+    def _payload_response(self, data: bytes, binary: bool) -> dict:
+        """Return a payload in the codec the client is speaking."""
+        if binary:
+            return {"ok": True, "data": data}
+        return {"ok": True, "data_hex": data.hex()}
+
+    async def _dispatch(self, req: dict, binary: bool = False) -> dict:
         op = req.get("op")
 
         if op == "store":
-            data = bytes.fromhex(req["data_hex"])
+            data = request_payload(req)
+            if data is None:
+                return {"ok": False, "error": "store requires 'data' (bytes) or 'data_hex' (hex)"}
             durability = Durability(req.get("durability", "pinned"))
             key = req.get("key")
             try:
@@ -207,7 +286,7 @@ class RpcServer:
                     data = await self.replication.load_remote_by_key_anywhere(key)
             if data is None:
                 return {"ok": False, "error": "not found"}
-            return {"ok": True, "data_hex": data.hex()}
+            return self._payload_response(data, binary)
 
         elif op == "free":
             freed = await self.block_manager.free(req["block_id"])
@@ -227,7 +306,9 @@ class RpcServer:
             # Explicit placement on a named peer (by pubkey prefix), for
             # demoing/debugging the cluster rather than relying on
             # automatic best-fit placement.
-            data = bytes.fromhex(req["data_hex"])
+            data = request_payload(req)
+            if data is None:
+                return {"ok": False, "error": "remote_store requires 'data' or 'data_hex'"}
             durability = Durability(req.get("durability", "cache"))
             pubkey = await self._resolve_peer(req["peer"])
             try:
@@ -246,7 +327,7 @@ class RpcServer:
                 return {"ok": False, "error": str(e)}
             if data is None:
                 return {"ok": False, "error": "not found"}
-            return {"ok": True, "data_hex": data.hex()}
+            return self._payload_response(data, binary)
 
         elif op == "remote_free":
             # Symmetric with remote_store/remote_load: release a block

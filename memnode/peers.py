@@ -38,6 +38,7 @@ from typing import Any, Callable, Optional
 from urllib.parse import quote
 
 from . import config
+from .mux import ChannelMux
 from .ratelimit import HandshakeGuard, HandshakeRejected, peer_ip
 from .security import NodeIdentity, SecureChannel, perform_handshake
 from .tlsmode import TlsPinMismatch, TlsSettings, build_client_context, build_server_context, enforce_pin
@@ -56,6 +57,9 @@ class PeerInfo:
     remote_quota: int = 0
     sas: str = ""
     verified: bool = False
+    # Phase 2: all traffic to this peer goes through a round-robin
+    # multiplexer so one large transfer cannot block unrelated messages.
+    mux: "ChannelMux | None" = None
 
 
 def pairing_uri(pubkey_hex: str, sas: str = "", name: str = "") -> str:
@@ -437,41 +441,59 @@ class PeerManager:
 
     # -- registry --------------------------------------------------------
 
-    async def _register(self, pubkey_hex, name, addr, channel, peer_info):
+    async def _register(self, pubkey_hex, name, addr, channel, peer_info) -> PeerInfo:
+        async def dispatch(msg):
+            if self.message_handler is not None:
+                await self.message_handler(pubkey_hex, msg)
+            else:
+                logger.debug("message from %s: %s", pubkey_hex[:8], msg.type)
+
+        mux = ChannelMux(channel, on_message=dispatch, label=pubkey_hex[:8])
+        info = PeerInfo(
+            pubkey_hex=pubkey_hex, name=name, addr=addr, channel=channel,
+            remote_quota=peer_info.get("ram_quota", 0),
+            sas=peer_info.get("sas", ""),
+            verified=self.trust_store.is_verified(pubkey_hex),
+            mux=mux,
+        )
         async with self._lock:
-            self.peers[pubkey_hex] = PeerInfo(
-                pubkey_hex=pubkey_hex, name=name, addr=addr, channel=channel,
-                remote_quota=peer_info.get("ram_quota", 0),
-                sas=peer_info.get("sas", ""),
-                verified=self.trust_store.is_verified(pubkey_hex),
-            )
+            self.peers[pubkey_hex] = info
         logger.info("peer connected: %s (%s) at %s [verified=%s]",
                     name, pubkey_hex[:8], addr, self.trust_store.is_verified(pubkey_hex))
+        return info
 
     async def _read_loop(self, pubkey_hex: str, channel: SecureChannel):
+        """Drive the multiplexer for one peer until the connection ends."""
+        async with self._lock:
+            info = self.peers.get(pubkey_hex)
+        if info is None or info.mux is None:
+            return
         try:
-            while True:
-                msg = await channel.recv_msg()
-                if self.message_handler is not None:
-                    try:
-                        await self.message_handler(pubkey_hex, msg)
-                    except Exception:
-                        logger.exception("message handler raised for msg from %s -- continuing",
-                                         pubkey_hex[:8])
-                else:
-                    logger.debug("message from %s: %s", pubkey_hex[:8], msg.type)
+            await info.mux.run()
         except Exception as e:
             logger.info("peer %s disconnected: %s", pubkey_hex[:8], e)
         finally:
+            info.mux.close()
             async with self._lock:
                 self.peers.pop(pubkey_hex, None)
 
-    async def send_to(self, pubkey_hex: str, msg) -> bool:
+    async def send_to(self, pubkey_hex: str, msg, stream_id: int | None = None) -> bool:
+        """Queue a message to a peer on the given logical stream.
+
+        Returns False if the peer is not connected, matching the previous
+        contract; callers treat that as "peer went away".
+        """
         async with self._lock:
             peer = self.peers.get(pubkey_hex)
         if peer is None:
             return False
-        await peer.channel.send_msg(msg)
+        if peer.mux is None:                 # defensive: direct-channel fallback
+            await peer.channel.send_msg(msg)
+            return True
+        try:
+            await peer.mux.send(msg, stream_id=stream_id)
+        except ConnectionError:
+            return False
         return True
 
     async def best_peer_for_store(self, size: int) -> Optional[str]:

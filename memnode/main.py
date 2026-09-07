@@ -37,6 +37,38 @@ async def _peer_listener(host: str, port: int, peer_manager: PeerManager):
         await server.serve_forever()
 
 
+def _install_fast_event_loop() -> str:
+    """Swap in uvloop when it is available.
+
+    uvloop is a libuv-backed drop-in replacement for the asyncio event
+    loop. It is a policy swap, not a code change: every ``await`` in this
+    codebase is unchanged. It is also strictly optional -- a daemon that
+    refuses to start because an accelerator is missing would be a worse
+    problem than running slightly slower, so an ImportError is logged and
+    ignored.
+
+    Note this helps I/O dispatch (socket readiness, callback scheduling),
+    not the crypto or the copying, so the gain depends on how
+    syscall-bound the workload is. Measure with bench/bench_rpc.py rather
+    than assuming a figure.
+    """
+    if not config.USE_UVLOOP:
+        return "asyncio"
+    try:
+        import uvloop
+    except ImportError:
+        logger.info("uvloop not installed -- using the stdlib asyncio event loop "
+                    "(pip install uvloop for a faster one)")
+        return "asyncio"
+    try:
+        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+    except Exception:
+        logger.warning("could not install uvloop -- continuing on stdlib asyncio", exc_info=True)
+        return "asyncio"
+    logger.info("using uvloop event loop")
+    return "uvloop"
+
+
 def _install_task_exception_logging(loop: asyncio.AbstractEventLoop):
     def handler(loop, context):
         logger.error(
@@ -129,6 +161,8 @@ def main():
                          help="skip mDNS auto-discovery (recommended when demoing several "
                               "nodes on localhost -- use the RPC 'connect' op instead)")
     parser.add_argument("--log-level", default="INFO")
+    parser.add_argument("--no-uvloop", action="store_true",
+                         help="force the stdlib asyncio event loop even if uvloop is installed")
 
     sec = parser.add_argument_group("security (phase 1)")
     sec.add_argument("--rpc-bind", default=config.RPC_BIND_HOST,
@@ -174,6 +208,10 @@ def main():
             args.rpc_socket = f"/tmp/memcloud-{args.rpc_port}.sock"
 
     logging.basicConfig(level=args.log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+    if args.no_uvloop:
+        config.USE_UVLOOP = False
+    _install_fast_event_loop()
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)

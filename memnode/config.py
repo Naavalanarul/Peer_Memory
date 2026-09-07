@@ -86,3 +86,43 @@ SAS_DIGITS = 6                       # short authentication string length
 REQUIRE_SAS_VERIFICATION = False     # when True, first contact needs an
                                       # explicit out-of-band confirmation
 TRUST_STORE_VERSION = 2
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 -- latency reduction
+# ---------------------------------------------------------------------------
+
+# --- Block store sharding ---
+# Number of independent lock-striped sub-maps in BlockManager. Powers of
+# two keep the modulo cheap. More stripes reduce queueing on the lock;
+# past a point they only add per-stripe bookkeeping to stats().
+BLOCK_STRIPE_COUNT = 16
+
+# --- Peer transfer chunking ---
+# Large blocks are split across several frames instead of one giant AEAD
+# frame. A 16 MB frame occupies the connection for its entire write, so
+# every unrelated request behind it waits (head-of-line blocking). At
+# 256 KB per chunk, an interleaved small request waits at most one chunk.
+PEER_CHUNK_SIZE = 256 * 1024
+PEER_CHUNK_THRESHOLD = 512 * 1024        # below this, send in one frame
+MAX_INBOUND_STREAMS = 64                  # concurrent inbound transfers per peer
+INBOUND_STREAM_TIMEOUT = 120.0            # abandon a half-finished transfer
+
+# --- Connection multiplexing ---
+# Logical streams share one encrypted connection. The writer round-robins
+# across streams so a long transfer cannot starve unrelated messages.
+MUX_MAX_QUEUED_MESSAGES = 512             # backpressure threshold per connection
+CONTROL_STREAM_ID = 0                     # small/control messages
+
+# --- RPC binary framing ---
+# Clients that open with this magic preamble get msgpack framing with raw
+# binary payloads instead of hex-in-JSON. Hex doubles every payload on the
+# wire and costs a bytes.fromhex()/.hex() pass on both ends. Clients that
+# do not send the preamble keep the original JSON protocol.
+RPC_MSGPACK_MAGIC = b"MNB1"
+RPC_MAGIC_LEN = 4
+
+# --- Event loop ---
+# uvloop is a drop-in libuv-backed replacement for the asyncio event loop.
+# Optional: absence must never stop the daemon starting.
+USE_UVLOOP = True

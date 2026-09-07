@@ -82,6 +82,13 @@ class MsgType(str, Enum):
                                 # blocks (see rpc.py's "remote_free" op),
                                 # not just ones stored on this node.
     FREED = "Freed"             # reply to FreeBlock: {"freed": bool}
+    BLOCK_CHUNK = "BlockChunk"  # one slice of a chunked transfer -- see
+                                # replication.py. Large blocks are split
+                                # across many small frames instead of one
+                                # giant AEAD frame so they cannot occupy
+                                # the connection end-to-end and block
+                                # unrelated messages behind them.
+    STREAM_ABORT = "StreamAbort"  # sender/receiver gave up on a transfer
     BYE = "Bye"
 
 
@@ -92,9 +99,27 @@ class Message:
     Serialized with msgpack: compact, cross-language (the JS/TS SDK can
     read the same bytes), and -- unlike pickle -- safe to deserialize
     from data sent by an untrusted peer.
+
+    Phase 2 conventions
+    -------------------
+    * ``body["stream_id"]`` names a logical stream inside one encrypted
+      connection. The multiplexer (``mux.ChannelMux``) round-robins
+      between streams, so a long transfer on one stream cannot starve
+      messages on another. Absent means the control stream (0).
+    * Payloads travel as msgpack ``bin`` (raw ``bytes``) under ``data``
+      / ``chunk``, not as hex under ``data_hex``. Hex doubled every
+      payload on the wire and cost a full encode/decode pass on both
+      ends. ``data_hex`` is still *accepted* on receive for
+      interoperability with older senders -- see
+      ``replication.extract_payload``.
     """
     type: MsgType
     body: dict = field(default_factory=dict)
+
+    @property
+    def stream_id(self) -> int:
+        value = self.body.get("stream_id", 0)
+        return value if isinstance(value, int) else 0
 
     def encode(self) -> bytes:
         return msgpack.packb({"type": self.type.value, "body": self.body}, use_bin_type=True)
